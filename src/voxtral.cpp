@@ -1,15 +1,16 @@
 #include "voxtral.h"
 #include "gguf.h"
 #include "ggml-cpu.h"
+#ifdef GGML_USE_METAL
+#include "ggml-metal.h"
+#endif
 
 #include <algorithm>
 #include <array>
 #include <cassert>
 #include <chrono>
 #include <cmath>
-#include <cstdarg>
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <numeric>
@@ -25,11 +26,9 @@
 static constexpr float VOXTRAL_PI = 3.14159265358979323846f;
 static constexpr int32_t VOXTRAL_N_FFT       = VOXTRAL_WINDOW_SIZE;         // 400
 static constexpr int32_t VOXTRAL_N_FREQ      = VOXTRAL_N_FFT / 2 + 1;      // 201
-static constexpr int32_t VOXTRAL_MAX_AUDIO_S = 30 * VOXTRAL_SAMPLE_RATE;    // 30 s
 static constexpr int32_t VOXTRAL_MAX_MEL_FRAMES = 4000;
 static constexpr int32_t VOXTRAL_MAX_ENC_SEQ = VOXTRAL_MAX_MEL_FRAMES / 2;  // after conv stride-2
 static constexpr int32_t VOXTRAL_MAX_DEC_SEQ = VOXTRAL_MAX_ENC_SEQ / VOXTRAL_DOWNSAMPLE_FACTOR;
-static constexpr int32_t VOXTRAL_PROMPT_LEN  = 1 + (VOXTRAL_N_LEFT_PAD_TOKENS + VOXTRAL_N_DELAY_TOKENS); // 39
 
 // ============================================================================
 // Logging helper
@@ -56,31 +55,31 @@ static constexpr int32_t VOXTRAL_PROMPT_LEN  = 1 + (VOXTRAL_N_LEFT_PAD_TOKENS + 
 struct voxtral_encoder_layer {
     ggml_tensor * attn_norm_weight;  // [enc_dim]
     ggml_tensor * attn_q_weight;     // [enc_heads*enc_head_dim, enc_dim]
-    struct ggml_tensor * attn_q_bias;       // [enc_heads*enc_head_dim]
-    struct ggml_tensor * attn_k_weight;     // [enc_kv_heads*enc_head_dim, enc_dim]
-    struct ggml_tensor * attn_v_weight;     // [enc_kv_heads*enc_head_dim, enc_dim]
-    struct ggml_tensor * attn_v_bias;       // [enc_kv_heads*enc_head_dim]
-    struct ggml_tensor * attn_o_weight;     // [enc_dim, enc_heads*enc_head_dim]
-    struct ggml_tensor * attn_o_bias;       // [enc_dim]
-    struct ggml_tensor * ffn_norm_weight;   // [enc_dim]
-    struct ggml_tensor * ffn_w1_weight;     // [enc_hidden, enc_dim]
-    struct ggml_tensor * ffn_w2_weight;     // [enc_dim, enc_hidden]
-    struct ggml_tensor * ffn_w2_bias;       // [enc_dim]
-    struct ggml_tensor * ffn_w3_weight;     // [enc_hidden, enc_dim]
+    ggml_tensor * attn_q_bias;       // [enc_heads*enc_head_dim]
+    ggml_tensor * attn_k_weight;     // [enc_kv_heads*enc_head_dim, enc_dim]
+    ggml_tensor * attn_v_weight;     // [enc_kv_heads*enc_head_dim, enc_dim]
+    ggml_tensor * attn_v_bias;       // [enc_kv_heads*enc_head_dim]
+    ggml_tensor * attn_o_weight;     // [enc_dim, enc_heads*enc_head_dim]
+    ggml_tensor * attn_o_bias;       // [enc_dim]
+    ggml_tensor * ffn_norm_weight;   // [enc_dim]
+    ggml_tensor * ffn_w1_weight;     // [enc_hidden, enc_dim]
+    ggml_tensor * ffn_w2_weight;     // [enc_dim, enc_hidden]
+    ggml_tensor * ffn_w2_bias;       // [enc_dim]
+    ggml_tensor * ffn_w3_weight;     // [enc_hidden, enc_dim]
 };
 
 struct voxtral_decoder_layer {
-    struct ggml_tensor * attn_norm_weight;  // [dec_dim]
-    struct ggml_tensor * attn_q_weight;     // [dec_heads*dec_head_dim, dec_dim]
-    struct ggml_tensor * attn_k_weight;     // [dec_kv_heads*dec_head_dim, dec_dim]
-    struct ggml_tensor * attn_v_weight;     // [dec_kv_heads*dec_head_dim, dec_dim]
-    struct ggml_tensor * attn_o_weight;     // [dec_dim, dec_heads*dec_head_dim]
-    struct ggml_tensor * ffn_norm_weight;   // [dec_dim]
-    struct ggml_tensor * ffn_w1_weight;     // [dec_hidden, dec_dim]
-    struct ggml_tensor * ffn_w2_weight;     // [dec_dim, dec_hidden]
-    struct ggml_tensor * ffn_w3_weight;     // [dec_hidden, dec_dim]
-    struct ggml_tensor * ada0_weight;       // [ada_dim, dec_dim]
-    struct ggml_tensor * ada2_weight;       // [dec_dim, ada_dim]
+    ggml_tensor * attn_norm_weight;  // [dec_dim]
+    ggml_tensor * attn_q_weight;     // [dec_heads*dec_head_dim, dec_dim]
+    ggml_tensor * attn_k_weight;     // [dec_kv_heads*dec_head_dim, dec_dim]
+    ggml_tensor * attn_v_weight;     // [dec_kv_heads*dec_head_dim, dec_dim]
+    ggml_tensor * attn_o_weight;     // [dec_dim, dec_heads*dec_head_dim]
+    ggml_tensor * ffn_norm_weight;   // [dec_dim]
+    ggml_tensor * ffn_w1_weight;     // [dec_hidden, dec_dim]
+    ggml_tensor * ffn_w2_weight;     // [dec_dim, dec_hidden]
+    ggml_tensor * ffn_w3_weight;     // [dec_hidden, dec_dim]
+    ggml_tensor * ada0_weight;       // [ada_dim, dec_dim]
+    ggml_tensor * ada2_weight;       // [dec_dim, ada_dim]
 };
 
 // ============================================================================
@@ -89,24 +88,24 @@ struct voxtral_decoder_layer {
 
 struct voxtral_model {
     // Encoder conv stem
-    struct ggml_tensor * enc_conv0_weight;  // [enc_dim, num_mel_bins, 3]
-    struct ggml_tensor * enc_conv0_bias;    // [enc_dim]
-    struct ggml_tensor * enc_conv1_weight;  // [enc_dim, enc_dim, 3]
-    struct ggml_tensor * enc_conv1_bias;    // [enc_dim]
+    ggml_tensor * enc_conv0_weight;  // [enc_dim, num_mel_bins, 3]
+    ggml_tensor * enc_conv0_bias;    // [enc_dim]
+    ggml_tensor * enc_conv1_weight;  // [enc_dim, enc_dim, 3]
+    ggml_tensor * enc_conv1_bias;    // [enc_dim]
     std::vector<voxtral_encoder_layer> enc_layers;
-    struct ggml_tensor * enc_norm_weight;   // [enc_dim]
+    ggml_tensor * enc_norm_weight;   // [enc_dim]
 
     // Adapter
-    struct ggml_tensor * adapter_0_weight;  // [dec_dim, enc_dim*downsample]
-    struct ggml_tensor * adapter_2_weight;  // [dec_dim, dec_dim]
+    ggml_tensor * adapter_0_weight;  // [dec_dim, enc_dim*downsample]
+    ggml_tensor * adapter_2_weight;  // [dec_dim, dec_dim]
 
     // Decoder
-    struct ggml_tensor * tok_embeddings_weight; // [vocab_size, dec_dim]
+    ggml_tensor * tok_embeddings_weight; // [vocab_size, dec_dim]
     std::vector<voxtral_decoder_layer> dec_layers;
-    struct ggml_tensor * dec_norm_weight;   // [dec_dim]
+    ggml_tensor * dec_norm_weight;   // [dec_dim]
 
     // Mel filters (stored in GGUF)
-    struct ggml_tensor * mel_filters;       // [n_freq, n_mel] = [201, 128]
+    ggml_tensor * mel_filters;       // [n_freq, n_mel] = [201, 128]
 
     // Tokenizer (Tekken vocab)
     int32_t tokenizer_num_special_tokens = 1000;
@@ -115,9 +114,11 @@ struct voxtral_model {
     mutable std::unordered_map<int32_t, std::string> tokenizer_bytes_cache;
 
     // Owning contexts
-    struct ggml_context * ctx_gguf   = nullptr;
-    struct gguf_context * gguf_ctx   = nullptr;
+    ggml_context * ctx_gguf   = nullptr;
+    gguf_context * gguf_ctx   = nullptr;
     ggml_backend_buffer_t buf_weights = nullptr;
+    ggml_backend_t         backend_weights = nullptr;
+    bool                   weights_on_metal = false;
 };
 
 // ============================================================================
@@ -132,19 +133,20 @@ struct voxtral_context {
 
     // Backend
     ggml_backend_t         backend      = nullptr;
+    ggml_backend_t         backend_cpu  = nullptr;
     bool                   backend_is_cpu = true;
 
     // Persistent device tensors (allocated once)
-    struct ggml_context  * ctx_persistent = nullptr;
+    ggml_context  * ctx_persistent = nullptr;
     ggml_backend_buffer_t  buf_persistent = nullptr;
 
-    struct ggml_tensor * encoder_output  = nullptr;  // [enc_dim, max_enc_seq]
-    struct ggml_tensor * decoder_memory  = nullptr;  // [dec_dim, max_dec_seq]
-    struct ggml_tensor * decoder_logits  = nullptr;  // [vocab_size]
+    ggml_tensor * encoder_output  = nullptr;  // [enc_dim, max_enc_seq]
+    ggml_tensor * decoder_memory  = nullptr;  // [dec_dim, max_dec_seq]
+    ggml_tensor * decoder_logits  = nullptr;  // [vocab_size]
 
     // KV cache: [kv_heads*head_dim, dec_window, dec_layers]
-    struct ggml_tensor * kv_self_k       = nullptr;
-    struct ggml_tensor * kv_self_v       = nullptr;
+    ggml_tensor * kv_self_k       = nullptr;
+    ggml_tensor * kv_self_v       = nullptr;
 
     // Actual sizes (set per utterance)
     int32_t enc_seq_len  = 0;  // after conv, before left-trunc
@@ -492,11 +494,11 @@ static void compute_mel_spectrogram(
     const int32_t n_frames = n_stft_frames - 1;  // drop last frame (matching Python [:-1])
     *out_n_frames = n_frames;
 
-    const int32_t n_freq = VOXTRAL_N_FREQ;
-    const int32_t n_mel  = VOXTRAL_NUM_MEL_BINS;
-    const int32_t n_fft  = VOXTRAL_N_FFT;
-    const int32_t hop    = VOXTRAL_HOP_LENGTH;
-    const int32_t pad    = n_fft / 2;
+    constexpr int32_t n_freq = VOXTRAL_N_FREQ;
+    constexpr int32_t n_mel  = VOXTRAL_NUM_MEL_BINS;
+    constexpr int32_t n_fft  = VOXTRAL_N_FFT;
+    constexpr int32_t hop    = VOXTRAL_HOP_LENGTH;
+    constexpr int32_t pad    = n_fft / 2;
 
     if (n_frames <= 0) {
         return;
@@ -579,8 +581,8 @@ static void compute_mel_spectrogram(
 // GGUF tensor loading helper
 // ============================================================================
 
-static struct ggml_tensor * get_tensor(struct ggml_context * ctx, const char * name) {
-    struct ggml_tensor * t = ggml_get_tensor(ctx, name);
+static ggml_tensor * get_tensor(ggml_context * ctx, const char * name) {
+    ggml_tensor * t = ggml_get_tensor(ctx, name);
     if (!t) {
         fprintf(stderr, "voxtral: tensor '%s' not found in GGUF\n", name);
     }
@@ -593,7 +595,8 @@ static struct ggml_tensor * get_tensor(struct ggml_context * ctx, const char * n
 
 voxtral_model * voxtral_model_load_from_file(
     const std::string    & path,
-    voxtral_log_callback   logger)
+    voxtral_log_callback   logger,
+    bool                   use_metal)
 {
     auto log_info = [&](const std::string & msg) {
         if (logger) logger(voxtral_log_level::info, msg);
@@ -618,13 +621,35 @@ voxtral_model * voxtral_model_load_from_file(
     model->gguf_ctx  = gguf_ctx;
     model->ctx_gguf  = ctx_meta;
 
-    // Allocate a backend buffer for all the weights (CPU for now)
-    ggml_backend_t cpu_backend = ggml_backend_cpu_init();
-    model->buf_weights = ggml_backend_alloc_ctx_tensors(ctx_meta, cpu_backend);
-    ggml_backend_free(cpu_backend);
+    // Allocate a backend buffer for all the weights
+    ggml_backend_t weights_backend = nullptr;
+#ifdef GGML_USE_METAL
+    if (use_metal) {
+        weights_backend = ggml_backend_metal_init();
+        if (!weights_backend) {
+            fprintf(stderr, "voxtral: ggml_backend_metal_init() failed, falling back to CPU\n");
+        }
+    }
+#else
+    if (use_metal) {
+        fprintf(stderr, "voxtral: Metal backend not available in this build, using CPU\n");
+    }
+#endif
+    if (!weights_backend) {
+        weights_backend = ggml_backend_cpu_init();
+        use_metal = false;
+    }
+
+    model->backend_weights = weights_backend;
+    model->weights_on_metal = use_metal;
+    model->buf_weights = ggml_backend_alloc_ctx_tensors(ctx_meta, weights_backend);
 
     if (!model->buf_weights) {
         fprintf(stderr, "voxtral: failed to allocate weight buffer\n");
+        if (model->backend_weights) {
+            ggml_backend_free(model->backend_weights);
+            model->backend_weights = nullptr;
+        }
         gguf_free(gguf_ctx);
         ggml_free(ctx_meta);
         delete model;
@@ -643,7 +668,7 @@ voxtral_model * voxtral_model_load_from_file(
         const int n_tensors = gguf_get_n_tensors(gguf_ctx);
         for (int i = 0; i < n_tensors; i++) {
             const char * name = gguf_get_tensor_name(gguf_ctx, i);
-            struct ggml_tensor * t = ggml_get_tensor(ctx_meta, name);
+            ggml_tensor * t = ggml_get_tensor(ctx_meta, name);
             if (!t) continue;
 
             const size_t offset = gguf_get_data_offset(gguf_ctx) + gguf_get_tensor_offset(gguf_ctx, i);
@@ -776,6 +801,7 @@ voxtral_model * voxtral_model_load_from_file(
 void voxtral_model_free(voxtral_model * model) {
     if (!model) return;
     if (model->buf_weights) ggml_backend_buffer_free(model->buf_weights);
+    if (model->backend_weights) ggml_backend_free(model->backend_weights);
     if (model->ctx_gguf)    ggml_free(model->ctx_gguf);
     if (model->gguf_ctx)    gguf_free(model->gguf_ctx);
     delete model;
@@ -795,16 +821,36 @@ voxtral_context * voxtral_init_from_model(
     ctx->logger    = params.logger;
     ctx->n_threads = params.n_threads > 0 ? params.n_threads : 4;
 
-    // Use CPU backend (weights already on CPU)
-    ctx->backend = ggml_backend_cpu_init();
-    ctx->backend_is_cpu = true;
-    ggml_backend_cpu_set_n_threads(ctx->backend, ctx->n_threads);
+    // Select backend
+    bool want_metal = params.use_metal || (model && model->weights_on_metal);
 
-    LOG_INFO(ctx, "backend: CPU with %d threads", ctx->n_threads);
+#ifdef GGML_USE_METAL
+    if (want_metal) {
+        ctx->backend = ggml_backend_metal_init();
+        if (!ctx->backend) {
+            LOG_WARN(ctx, "failed to initialize Metal backend, falling back to CPU");
+        }
+    }
+#endif
+    if (!ctx->backend) {
+        ctx->backend = ggml_backend_cpu_init();
+        ctx->backend_is_cpu = true;
+    } else {
+        ctx->backend_is_cpu = false;
+    }
+
+    if (ctx->backend_is_cpu) {
+        ggml_backend_cpu_set_n_threads(ctx->backend, ctx->n_threads);
+        LOG_INFO(ctx, "backend: CPU with %d threads", ctx->n_threads);
+    } else {
+        ctx->backend_cpu = ggml_backend_cpu_init();
+        ggml_backend_cpu_set_n_threads(ctx->backend_cpu, ctx->n_threads);
+        LOG_INFO(ctx, "backend: METAL (CPU fallback %d threads)", ctx->n_threads);
+    }
 
     // Allocate persistent tensors for encoder output, decoder memory, KV cache, logits
     {
-        const size_t n_tensors = 5;
+        constexpr size_t n_tensors = 5;
         ggml_init_params p = {
             /*.mem_size  =*/ ggml_tensor_overhead() * n_tensors,
             /*.mem_buffer=*/ nullptr,
@@ -856,12 +902,19 @@ voxtral_context * voxtral_init_from_model(
             enc_mb, dec_mb, kv_mb);
     }
 
-    // Schedulers (one backend: CPU)
-    ggml_backend_t backends[] = { ctx->backend };
-    ctx->sched_encoder  = ggml_backend_sched_new(backends, nullptr, 1, GGML_DEFAULT_GRAPH_SIZE, false, false);
-    ctx->sched_adapter  = ggml_backend_sched_new(backends, nullptr, 1, GGML_DEFAULT_GRAPH_SIZE, false, false);
-    ctx->sched_dec_pre  = ggml_backend_sched_new(backends, nullptr, 1, GGML_DEFAULT_GRAPH_SIZE, false, false);
-    ctx->sched_dec_step = ggml_backend_sched_new(backends, nullptr, 1, GGML_DEFAULT_GRAPH_SIZE, false, false);
+    // Schedulers (Metal + CPU fallback, or CPU only)
+    ggml_backend_t backends[2];
+    int n_backends = 0;
+    backends[n_backends++] = ctx->backend;
+    if (!ctx->backend_is_cpu && ctx->backend_cpu) {
+        backends[n_backends++] = ctx->backend_cpu;
+    }
+    const bool op_offload = !ctx->backend_is_cpu;
+
+    ctx->sched_encoder  = ggml_backend_sched_new(backends, nullptr, n_backends, GGML_DEFAULT_GRAPH_SIZE, false, op_offload);
+    ctx->sched_adapter  = ggml_backend_sched_new(backends, nullptr, n_backends, GGML_DEFAULT_GRAPH_SIZE, false, op_offload);
+    ctx->sched_dec_pre  = ggml_backend_sched_new(backends, nullptr, n_backends, GGML_DEFAULT_GRAPH_SIZE, false, op_offload);
+    ctx->sched_dec_step = ggml_backend_sched_new(backends, nullptr, n_backends, GGML_DEFAULT_GRAPH_SIZE, false, op_offload);
 
     // Hann window
     ctx->hann_window.resize(VOXTRAL_WINDOW_SIZE);
@@ -872,7 +925,7 @@ voxtral_context * voxtral_init_from_model(
 
     // Mel filters (compute on CPU if not available from model, else load from GGUF)
     if (model->mel_filters) {
-        const int32_t n = VOXTRAL_N_FREQ * VOXTRAL_NUM_MEL_BINS;
+        constexpr int32_t n = VOXTRAL_N_FREQ * VOXTRAL_NUM_MEL_BINS;
         ctx->mel_filters_cpu.resize(n);
         ggml_backend_tensor_get(model->mel_filters, ctx->mel_filters_cpu.data(), 0, n * sizeof(float));
     } else {
@@ -894,6 +947,7 @@ void voxtral_free(voxtral_context * ctx) {
     if (ctx->sched_dec_step) ggml_backend_sched_free(ctx->sched_dec_step);
     if (ctx->buf_persistent) ggml_backend_buffer_free(ctx->buf_persistent);
     if (ctx->ctx_persistent) ggml_free(ctx->ctx_persistent);
+    if (ctx->backend_cpu)    ggml_backend_free(ctx->backend_cpu);
     if (ctx->backend)        ggml_backend_free(ctx->backend);
     delete ctx;
 }
@@ -1056,7 +1110,7 @@ static void log_graph_info(voxtral_context * ctx, const char * name, struct ggml
 // Build encoder graph that writes output into ctx->encoder_output
 static ggml_cgraph * build_encoder_graph(
     voxtral_context * ctx,
-    struct ggml_context * gctx,
+    ggml_context * gctx,
     const float * mel_data,   // [n_mel, n_frames] on CPU
     int32_t n_frames)
 {
@@ -1257,7 +1311,7 @@ static ggml_cgraph * build_encoder_graph(
 
 static ggml_cgraph * build_adapter_graph(
     voxtral_context * ctx,
-    struct ggml_context * gctx)
+    ggml_context * gctx)
 {
     voxtral_model * model = ctx->model;
     const int32_t enc_seq = ctx->enc_seq_used;
@@ -1888,11 +1942,11 @@ static bool voxtral_transcribe_from_audio(
     }
 
     // 2. Streaming padding (matching Python pad_audio_streaming)
-    const int32_t mult_of   = VOXTRAL_RAW_AUDIO_LENGTH_PER_TOK;   // 1280
+    constexpr int32_t mult_of   = VOXTRAL_RAW_AUDIO_LENGTH_PER_TOK;   // 1280
     const int32_t n_raw     = n_samples;
     const int32_t align_pad = (mult_of - (n_raw % mult_of)) % mult_of;
     const int32_t right_pad = align_pad + VOXTRAL_N_RIGHT_PAD_TOKENS * mult_of;
-    const int32_t left_pad  = VOXTRAL_N_LEFT_PAD_TOKENS * mult_of;
+    constexpr int32_t left_pad  = VOXTRAL_N_LEFT_PAD_TOKENS * mult_of;
 
     std::vector<float> padded(left_pad + n_raw + right_pad, 0.0f);
     memcpy(padded.data() + left_pad, audio, n_raw * sizeof(float));

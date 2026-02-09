@@ -22,6 +22,7 @@ struct cli_params {
     uint32_t seed = 0;
     int32_t max_tokens = 256;
     voxtral_log_level log_level = voxtral_log_level::info;
+    bool use_metal = false;
 };
 
 void print_usage(const char * argv0) {
@@ -42,6 +43,7 @@ void print_usage(const char * argv0) {
         << "  --dump-logits-bin P   write full step-0 logits as float32 raw bytes\n"
         << "  --dump-tokens PATH    write generated token ids as a single line\n"
         << "  --output-text PATH    write decoded text to file (still prints to stdout)\n"
+        << "  --metal               use Metal backend when available\n"
         << "  -h, --help            show this help\n";
 }
 
@@ -168,6 +170,8 @@ bool parse_args(int argc, char ** argv, cli_params & p) {
                 return false;
             }
             p.output_text = v;
+        } else if (a == "--metal") {
+            p.use_metal = true;
         } else {
             std::cerr << "unknown option: " << a << "\n";
             return false;
@@ -217,7 +221,7 @@ int main(int argc, char ** argv) {
         std::cerr << "voxtral_" << tag << ": " << msg << "\n";
     };
 
-    voxtral_model * model = voxtral_model_load_from_file(p.model, logger);
+    voxtral_model * model = voxtral_model_load_from_file(p.model, logger, p.use_metal);
     if (!model) {
         return 2;
     }
@@ -227,6 +231,7 @@ int main(int argc, char ** argv) {
     // ctx_p.seed = p.seed;
     ctx_p.log_level = p.log_level;
     ctx_p.logger = logger;
+    ctx_p.use_metal = p.use_metal;
 
     voxtral_context * ctx = voxtral_init_from_model(model, ctx_p);
     if (!ctx) {
