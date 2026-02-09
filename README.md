@@ -64,14 +64,6 @@ The test suite runs over `samples/*.wav` files.
 To verify numeric parity against the reference implementation:
 
 ```bash
-# 1. Generate golden references (requires torch in a separate environment)
-python3 tests/generate_golden.py \
-  --model-dir models/voxtral \
-  --output tests/golden/voxtral_reference.json
-
-# 2. Run tests
-ctest --test-dir build --output-on-failure
-# OR
 python3 tests/test_voxtral_reference.py
 ```
 
