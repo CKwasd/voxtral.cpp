@@ -1,4 +1,4 @@
-# voxtral.cpp
+# voxtral.cpp [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/andrijdavid/voxtral.cpp/blob/main/voxtral.cpp_colab.ipynb)
 
 A ggml-based C++ implementation of Voxtral Realtime 4B.
 
